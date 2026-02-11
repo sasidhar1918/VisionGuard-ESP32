@@ -12,7 +12,7 @@ camera_fb_t* sharedFrame = NULL;
 
 
 
-const char* telegramBotToken = "7541177164:AAExr-ozcDn5Hhsd5G3USe55Y9-Tn9EfboI";
+const char* telegramBotToken = "xxxxxxxxxxxxxxxxxxxx";
 const char* telegramChatId = "6414041079";
 
 

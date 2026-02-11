@@ -1,0 +1,300 @@
+#include "esp_camera.h"
+#include "esp_http_server.h"
+#include <WiFi.h>
+#include <ESP_Mail_Client.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include <WiFiClientSecure.h>
+
+SemaphoreHandle_t frameMutex;
+camera_fb_t* sharedFrame = NULL;
+
+
+
+
+const char* telegramBotToken = "7541177164:AAExr-ozcDn5Hhsd5G3USe55Y9-Tn9EfboI";
+const char* telegramChatId = "6414041079";
+
+
+
+// Replace with your network credentials
+const char* ssid = "Free_Wi-Fi";
+const char* password = "244466666";
+
+// AI Thinker ESP32-CAM pin configuration
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM       5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+httpd_handle_t stream_httpd = NULL;
+
+
+// Camera stream handler
+esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+
+
+  if (xSemaphoreTake(frameMutex, portMAX_DELAY)) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      xSemaphoreGive(frameMutex); // don't forget to release mutex even on fail
+      return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+    res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    xSemaphoreGive(frameMutex); // release after done
+    return res;
+  } else {
+    Serial.println("Failed to lock mutex in stream_handler");
+    return ESP_FAIL;
+  }
+
+}
+
+// Basic HTML page with stream view
+esp_err_t index_handler(httpd_req_t *req) {
+  const char* html = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+    <head>
+      <meta charset="utf-8">
+      <title>ESP32-CAM Capture</title>
+      <script>
+        function reloadImage() {
+          const img = document.getElementById("cam");
+          img.src = "/stream?t=" + new Date().getTime();
+        }
+        setInterval(reloadImage, 1000); // 1 frame per second
+      </script>
+    </head>
+    <body style="margin:0; background:black;">
+      <img id="cam" src="/stream" style="width:100vw; height:100vh; object-fit:contain;" />
+    </body>
+  </html>
+  )rawliteral";
+
+  return httpd_resp_send(req, html, strlen(html));
+}
+
+
+// Start HTTP server
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+
+
+  httpd_uri_t index_uri = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = index_handler,
+    .user_ctx  = NULL
+  };
+
+  httpd_uri_t stream_uri = {
+    .uri       = "/stream",
+    .method    = HTTP_GET,
+    .handler   = stream_handler,
+    .user_ctx  = NULL
+  };
+
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+    httpd_register_uri_handler(stream_httpd, &index_uri);
+  }
+}
+
+unsigned long lastAlertTime = 0;
+const unsigned long alertCooldown = 30000; // 30 seconds (in milliseconds)
+
+
+void parallelTask(void *pvParameters) {
+  uint8_t* prev_buf = NULL;
+  size_t prev_len = 0;
+
+  while (true) {
+    camera_fb_t *cur_frame = NULL;
+
+    if (xSemaphoreTake(frameMutex, portMAX_DELAY)) {
+      cur_frame = esp_camera_fb_get();
+      xSemaphoreGive(frameMutex);
+
+      if (!cur_frame) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        continue;
+      }
+
+      bool motionDetected = false;
+
+      if (prev_buf && cur_frame->len == prev_len) {
+        int diffBytes = 0;
+        int step = 10; // Sample every 10th byte
+        for (int i = 0; i < cur_frame->len; i += step) {
+          if (cur_frame->buf[i] != prev_buf[i]) {
+            diffBytes++;
+          }
+        }
+
+        float diffRatio = (float)diffBytes / (cur_frame->len / step);
+        if (diffRatio > 0.85) {
+          motionDetected = true;
+          Serial.printf("Motion detected: %.2f%% diff\n", diffRatio * 100);
+        }
+      }
+
+      if (motionDetected && (millis() - lastAlertTime > alertCooldown)) {
+        sendIntruderAlert(cur_frame);  // Now sends to Telegram
+        lastAlertTime = millis();
+      } else if (motionDetected) {
+        Serial.println("Cooldown active, not sending alert.");
+      }
+
+      //  Clean and store current frame for next comparison
+      if (prev_buf) free(prev_buf);
+      prev_buf = (uint8_t*)malloc(cur_frame->len);
+      if (prev_buf) {
+        memcpy(prev_buf, cur_frame->buf, cur_frame->len);
+        prev_len = cur_frame->len;
+      } else {
+        Serial.println("Failed to allocate memory for prev_buf");
+        prev_len = 0;
+      }
+
+      esp_camera_fb_return(cur_frame);
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+
+
+
+void sendIntruderAlert(camera_fb_t *fb) {
+  if (!fb || !fb->buf || fb->len == 0) {
+    Serial.println("Invalid frame buffer");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure(); // If needed, for simplicity
+  delay(1000);
+
+  if (!client.connect("api.telegram.org", 443)) {
+    Serial.println("Connection to Telegram failed");
+    return;
+  }
+
+  String head = "--ESP32\r\n";
+  head += "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + String(telegramChatId) + "\r\n";
+  head += "--ESP32\r\n";
+  head += "Content-Disposition: form-data; name=\"caption\"\r\n\r\nMotion Detected 🚨\r\n";
+  head += "--ESP32\r\n";
+  head += "Content-Disposition: form-data; name=\"photo\"; filename=\"intruder.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
+
+  String tail = "\r\n--ESP32--\r\n";
+
+  String request = "POST /bot" + String(telegramBotToken) + "/sendPhoto HTTP/1.1\r\n";
+  request += "Host: api.telegram.org\r\n";
+  request += "Content-Type: multipart/form-data; boundary=ESP32\r\n";
+  request += "Content-Length: " + String(head.length() + fb->len + tail.length()) + "\r\n\r\n";
+
+  client.print(request);
+  client.print(head);
+  client.write(fb->buf, fb->len);
+  client.print(tail);
+
+  // Optional: Read response
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+
+  String response = client.readString();
+  Serial.println("Telegram response:");
+  Serial.println(response);
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+
+  Serial.print("Camera Stream Ready! Go to: http://");
+  Serial.println(WiFi.localIP());
+
+  // Camera config
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+
+  frameMutex = xSemaphoreCreateMutex();
+
+  // Start streaming server
+  startCameraServer();
+
+  // Start your parallel task
+  xTaskCreatePinnedToCore(parallelTask, "ParallelTask", 4096, NULL, 1, NULL, 1);
+}
+
+void loop() {
+  // No need to do anything here
+  delay(10000);
+}

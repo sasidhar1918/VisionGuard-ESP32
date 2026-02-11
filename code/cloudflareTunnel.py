@@ -7,7 +7,7 @@ import time
 ESP32_MAC = "78:42:1C:6D:C4:8C"
 
 # 🔹 Telegram Bot credentials
-BOT_TOKEN = "7541177164:AAExr-ozcDn5Hhsd5G3USe55Y9-Tn9EfboI"
+BOT_TOKEN = "xxxxxxxxxxxxxx"
 CHAT_ID = "6414041079"
 
 # 🔹 Path to cloudflared
@@ -33,7 +33,7 @@ def get_local_subnet(interface):
 
 def scan_network_for_mac(subnet, target_mac):
     """Scan network using nmap and return IP if MAC is matched."""
-    print(f"🔍 Scanning {subnet} for MAC {target_mac}...")
+    print(f" Scanning {subnet} for MAC {target_mac}...")
     try:
         output = subprocess.check_output(["nmap", "-sn", subnet], text=True)
         ip, mac = None, None
@@ -47,13 +47,13 @@ def scan_network_for_mac(subnet, target_mac):
                 if ip and mac and mac == target_mac.upper():
                     return ip
     except subprocess.CalledProcessError as e:
-        print("⚠ Error running nmap:", e)
+        print(" Error running nmap:", e)
     return None
 
 
 def start_cloudflare_tunnel(esp_ip):
     """Start Cloudflare tunnel and return the public URL."""
-    print(f"✅ Found ESP32 at {esp_ip}. Starting Cloudflare Tunnel...")
+    print(f"Found ESP32 at {esp_ip}. Starting Cloudflare Tunnel...")
     tunnel_cmd = f"{CLOUDFLARED_PATH} tunnel --url http://{esp_ip}:80 --no-chunked-encoding > cf_tunnel.log 2>&1 &"
     subprocess.Popen(tunnel_cmd, shell=True)
 
@@ -77,18 +77,18 @@ def send_telegram_message(url):
             data={"chat_id": CHAT_ID, "text": f"ESP32-CAM Stream: {url}"}
         )
         if response.status_code == 200:
-            print("📩 Sent URL via Telegram!")
+            print(" Sent URL via Telegram!")
         else:
-            print("⚠ Failed to send Telegram message.")
+            print(" Failed to send Telegram message.")
     except Exception as e:
-        print("⚠ Telegram error:", e)
+        print(" Telegram error:", e)
 
 
-# 🔁 Main logic
+#  Main logic
 while True:
     subnet = get_local_subnet(INTERFACE)
     if not subnet:
-        print("❌ Cannot detect subnet. Retrying...")
+        print(" Cannot detect subnet. Retrying...")
         time.sleep(5)
         continue
 
@@ -96,12 +96,12 @@ while True:
     if esp_ip:
         cf_url = start_cloudflare_tunnel(esp_ip)
         if cf_url:
-            print(f"🌍 ESP32-CAM Public URL: {cf_url}")
+            print(f" ESP32-CAM Public URL: {cf_url}")
             send_telegram_message(cf_url)
             break
         else:
-            print("⚠ Cloudflare tunnel URL not found. Retrying...")
+            print("Cloudflare tunnel URL not found. Retrying...")
     else:
-        print("🔄 ESP32 not found. Retrying in 5 seconds...")
+        print(" ESP32 not found. Retrying in 5 seconds...")
 
     time.sleep(5)
